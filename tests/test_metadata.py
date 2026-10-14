@@ -1,9 +1,10 @@
 import httpx
+import pytest
 
 from sub2m4b.metadata import API, MetadataError, fetch_metadata
 
 
-def test_anilist_mapping_jikan_pagination_and_language(tmp_path, monkeypatch):
+def test_anilist_mapping_edge_pagination_and_language(tmp_path, monkeypatch):
     monkeypatch.setattr("sub2m4b.metadata.time.sleep", lambda _: None)
     calls = []
 
@@ -23,16 +24,17 @@ def test_anilist_mapping_jikan_pagination_and_language(tmp_path, monkeypatch):
                     }
                 },
             )
+        assert request.url.host == "jikan.lucashdo.com"
         if request.url.path.endswith("/episodes"):
             page = int(request.url.params["page"])
             return httpx.Response(
                 200,
                 json={
-                    "data": [{"mal_id": page, "title_japanese": f"話{page}", "title": "English"}],
-                    "pagination": {"has_next_page": page == 1},
+                    "data": [{"number": page, "titleJapanese": f"話{page}", "title": "English"}],
+                    "meta": {"pagination": {"hasNextPage": page == 1}},
                 },
             )
-        return httpx.Response(200, json={"data": {"title": "Anime", "title_japanese": "アニメ"}})
+        return httpx.Response(200, json={"data": {"title": "Anime", "titleJapanese": "アニメ"}})
 
     api = API(tmp_path, httpx.Client(transport=httpx.MockTransport(handler)))
     result = fetch_metadata(api, "Anime")
@@ -46,19 +48,21 @@ def test_anilist_mapping_jikan_pagination_and_language(tmp_path, monkeypatch):
 
 
 def test_rate_limit_retry_and_cache(tmp_path, monkeypatch):
-    monkeypatch.setattr("sub2m4b.metadata.time.sleep", lambda _: None)
+    delays = []
+    monkeypatch.setattr("sub2m4b.metadata.time.sleep", delays.append)
     calls = []
 
     def handler(request):
         calls.append(request)
         if len(calls) == 1:
-            return httpx.Response(429, headers={"Retry-After": "0"})
+            return httpx.Response(429, headers={"Retry-After": "60"})
         return httpx.Response(200, json={"data": []})
 
     api = API(tmp_path, httpx.Client(transport=httpx.MockTransport(handler)))
-    assert api.request("https://api.jikan.moe/v4/anime") == {"data": []}
-    assert api.request("https://api.jikan.moe/v4/anime") == {"data": []}
+    assert api.request("https://jikan.lucashdo.com/v1/anime") == {"data": []}
+    assert api.request("https://jikan.lucashdo.com/v1/anime") == {"data": []}
     assert len(calls) == 2
+    assert 60 in delays
     api.close()
 
 
@@ -81,7 +85,7 @@ def test_missing_japanese_title_falls_back_to_default():
             if payload is not None:
                 raise MetadataError("unavailable")
             if "/episodes" in url:
-                return {"data": [{"mal_id": 1, "title_japanese": None, "title": "Hello"}]}
+                return {"data": [{"number": 1, "titleJapanese": None, "title": "Hello"}]}
             return {"data": {"title": "Anime"}}
 
     result = fetch_metadata(FakeAPI(), "Anime", mal_id=1)
@@ -108,7 +112,7 @@ def test_explicit_anilist_without_mal_mapping_keeps_selected_series():
     assert result.mal_id is None
 
 
-def test_explicit_mal_still_gets_cover_when_jikan_unavailable():
+def test_explicit_mal_still_gets_cover_when_edge_unavailable():
     class FakeAPI:
         def request(self, url, payload=None):
             if payload:
@@ -124,9 +128,92 @@ def test_explicit_mal_still_gets_cover_when_jikan_unavailable():
                         }
                     }
                 }
-            raise MetadataError("Jikan unavailable")
+            raise MetadataError("Jikan-Edge unavailable")
 
     result = fetch_metadata(FakeAPI(), "Anime", mal_id=123)
     assert result.cover_url == "https://example.com/cover.jpg"
     assert result.mal_id == 123
     assert result.titles == {}
+
+
+def test_edge_search_series_shape_and_stale_response(tmp_path, monkeypatch):
+    monkeypatch.setattr("sub2m4b.metadata.time.sleep", lambda _: None)
+    warnings = []
+
+    def handler(request):
+        if request.url.host == "graphql.anilist.co":
+            return httpx.Response(503)
+        assert request.url.host == "jikan.lucashdo.com"
+        assert "limit" not in request.url.params  # Edge rejects the old Jikan parameter.
+        if request.url.path == "/v1/anime":
+            assert request.url.params["q"] == "Anime"
+            return httpx.Response(200, json={"data": [{"malId": 123}]})
+        if request.url.path.endswith("/episodes"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"number": 1, "titleJapanese": "一話", "title": "First"}],
+                    "meta": {
+                        "stale": True,
+                        "refreshFailed": True,
+                        "fetchedAt": "2026-10-14T00:00:00Z",
+                        "pagination": {"hasNextPage": False},
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "title": "Anime",
+                    "titleJapanese": "アニメ",
+                    "titleEnglish": "The Anime",
+                    "images": {"large": "https://example.com/cover.jpg"},
+                }
+            },
+        )
+
+    api = API(tmp_path, httpx.Client(transport=httpx.MockTransport(handler)))
+    result = fetch_metadata(api, "Anime", warn=warnings.append)
+    assert result.mal_id == 123
+    assert result.title == "アニメ"
+    assert result.cover_url == "https://example.com/cover.jpg"
+    assert result.titles == {1: "一話"}
+    assert any("cached" in warning and "2026-10-14" in warning for warning in warnings)
+    api.close()
+
+
+def test_edge_error_includes_provider_request_id(tmp_path, monkeypatch):
+    monkeypatch.setattr("sub2m4b.metadata.time.sleep", lambda _: None)
+
+    def handler(request):
+        return httpx.Response(
+            502,
+            json={
+                "error": {
+                    "code": "UPSTREAM_UNAVAILABLE",
+                    "message": "Source unavailable",
+                    "requestId": "request-123",
+                }
+            },
+        )
+
+    api = API(tmp_path, httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(MetadataError, match="UPSTREAM_UNAVAILABLE.*request-123"):
+        api.request("https://jikan.lucashdo.com/v1/anime/123/episodes")
+    api.close()
+
+
+@pytest.mark.parametrize(
+    "language,expected", [("ja", "一話"), ("en", "First"), ("romaji", "First")]
+)
+def test_edge_episode_language_fallback(language, expected):
+    class FakeAPI:
+        def request(self, url, payload=None):
+            if payload:
+                raise MetadataError("unavailable")
+            if url.endswith("/episodes?page=1"):
+                return {"data": [{"number": 1, "titleJapanese": "一話", "title": "First"}]}
+            return {"data": {"title": "Anime"}}
+
+    assert fetch_metadata(FakeAPI(), "Anime", mal_id=1, language=language).titles == {1: expected}

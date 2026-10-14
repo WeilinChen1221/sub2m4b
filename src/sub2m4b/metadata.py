@@ -1,4 +1,4 @@
-"""AniList series metadata and Jikan episode titles, with a local response cache."""
+"""AniList series metadata and Jikan-Edge episode titles, with a local response cache."""
 
 import hashlib
 import json
@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
+
+EDGE_BASE = "https://jikan.lucashdo.com/v1"
 
 
 class MetadataError(RuntimeError):
@@ -30,7 +32,7 @@ class API:
         self.client = client or httpx.Client(
             timeout=15, follow_redirects=True, headers={"User-Agent": "sub2m4b/0.1"}
         )
-        self.last_jikan = 0.0
+        self.last_edge = 0.0
 
     def close(self) -> None:
         self.client.close()
@@ -45,9 +47,9 @@ class API:
                 pass
         error = None
         for attempt in range(3):
-            if "api.jikan.moe" in url:
-                time.sleep(max(0, 1.1 - (time.monotonic() - self.last_jikan)))
-                self.last_jikan = time.monotonic()
+            if httpx.URL(url).host == "jikan.lucashdo.com":
+                time.sleep(max(0, 1.1 - (time.monotonic() - self.last_edge)))
+                self.last_edge = time.monotonic()
             try:
                 response = (
                     self.client.post(url, json=payload)
@@ -56,18 +58,29 @@ class API:
                 )
                 response.raise_for_status()
                 data = response.json()
-                if data.get("errors"):
-                    raise MetadataError(str(data["errors"]))
+                if not isinstance(data, dict):
+                    raise MetadataError("API response must be a JSON object")
+                if data.get("errors") or data.get("error"):
+                    raise MetadataError(str(data.get("errors") or data["error"]))
                 cached.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
                 return data
             except (httpx.HTTPError, ValueError, MetadataError) as exc:
                 error = exc
                 if isinstance(exc, httpx.HTTPStatusError):
+                    try:
+                        detail = exc.response.json().get("error")
+                        if isinstance(detail, dict):
+                            error = (
+                                f"HTTP {exc.response.status_code}: {detail.get('code')}: "
+                                f"{detail.get('message')} (request {detail.get('requestId')})"
+                            )
+                    except (ValueError, AttributeError):
+                        pass
                     status = exc.response.status_code
                     if status < 500 and status != 429:
                         break
                     retry = exc.response.headers.get("Retry-After", "")
-                    delay = min(float(retry), 30) if retry.isdigit() else 2**attempt
+                    delay = min(float(retry), 60) if retry.isdigit() else 2**attempt
                 else:
                     delay = 2**attempt
                 if attempt < 2:
@@ -90,6 +103,19 @@ class API:
         return path
 
 
+def edge_request(api: API, url: str, warn: Callable[[str], None]) -> dict:
+    data = api.request(url)
+    meta = data.get("meta", {})
+    if meta.get("stale"):
+        message = (
+            f"Jikan-Edge returned cached metadata from {meta.get('fetchedAt', 'an unknown date')}"
+        )
+        if meta.get("refreshFailed"):
+            message += "; upstream refresh failed"
+        warn(message)
+    return data
+
+
 def fetch_metadata(
     api: API,
     query: str,
@@ -100,7 +126,7 @@ def fetch_metadata(
     warn: Callable[[str], None] = lambda _: None,
 ) -> AnimeMetadata:
     result = AnimeMetadata(query, mal_id=mal_id, anilist_id=anilist_id)
-    # AniList provides the MAL mapping and cover; Jikan provides paginated episode names.
+    # AniList provides the MAL mapping and cover; Jikan-Edge provides episode names.
     if mal_id is not None:
         selector, declaration, variables = "idMal: $id", "$id: Int", {"id": mal_id}
     elif anilist_id is not None:
@@ -129,36 +155,35 @@ def fetch_metadata(
         return result
     if result.mal_id is None:
         try:
-            url = str(httpx.URL("https://api.jikan.moe/v4/anime", params={"q": query, "limit": 1}))
-            matches = api.request(url)["data"]
+            url = str(httpx.URL(f"{EDGE_BASE}/anime", params={"q": query}))
+            matches = edge_request(api, url, warn)["data"]
             if not matches:
                 raise MetadataError(f"No anime matched {query!r}")
-            result.mal_id = matches[0]["mal_id"]
+            result.mal_id = matches[0]["malId"]
         except (MetadataError, KeyError, TypeError) as exc:
-            warn(f"Jikan search unavailable: {exc}")
+            warn(f"Jikan-Edge search unavailable: {exc}")
             return result
     if not result.cover_url or result.anilist_id is None:
         try:
-            data = api.request(f"https://api.jikan.moe/v4/anime/{result.mal_id}")["data"]
-            key = {"ja": "title_japanese", "en": "title_english", "romaji": "title"}[language]
+            data = edge_request(api, f"{EDGE_BASE}/anime/{result.mal_id}", warn)["data"]
+            key = {"ja": "titleJapanese", "en": "titleEnglish", "romaji": "title"}[language]
             result.title = data.get(key) or data["title"]
-            result.cover_url = result.cover_url or data.get("images", {}).get("jpg", {}).get(
-                "large_image_url"
-            )
+            result.cover_url = result.cover_url or data.get("images", {}).get("large")
         except (MetadataError, KeyError, TypeError) as exc:
-            warn(f"Jikan series metadata unavailable: {exc}")
+            warn(f"Jikan-Edge series metadata unavailable: {exc}")
     page = 1
     try:
         while True:
-            data = api.request(
-                f"https://api.jikan.moe/v4/anime/{result.mal_id}/episodes?page={page}"
+            data = edge_request(
+                api, f"{EDGE_BASE}/anime/{result.mal_id}/episodes?page={page}", warn
             )
             for episode in data["data"]:
-                key = {"ja": "title_japanese", "en": "title", "romaji": "title_romanji"}[language]
+                # Edge exposes Japanese and default titles, but no romaji episode field.
+                key = "titleJapanese" if language == "ja" else "title"
                 title = episode.get(key) or episode.get("title")
                 if title:
-                    result.titles[int(episode["mal_id"])] = title
-            if not data.get("pagination", {}).get("has_next_page"):
+                    result.titles[int(episode["number"])] = title
+            if not data.get("meta", {}).get("pagination", {}).get("hasNextPage"):
                 break
             page += 1
             if page > 100:

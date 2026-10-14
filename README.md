@@ -1,6 +1,6 @@
 # sub2m4b
 
-Turn a season of subtitled anime into an AAC `.m4b` audiobook for Japanese listening practice. Each episode becomes a chapter. AniList supplies series information and cover art; Jikan supplies episode titles from MyAnimeList.
+Turn a season of subtitled anime into an AAC `.m4b` audiobook for Japanese listening practice. Each episode becomes a chapter. AniList supplies series information and cover art; Jikan-Edge supplies episode titles from MyAnimeList.
 
 The CLI keeps audio covered by subtitle cues, including 75 ms before and 175 ms after each cue by default. It merges overlapping cues so dialogue never repeats. It does not detect voices or separate dialogue from background music. Signs, sound-effect captions and song lyrics may retain unwanted audio. Use ASS style filters when available.
 
@@ -38,7 +38,7 @@ uv run sub2m4b build '/path/to/anime' \
   --output output/nozaki-kun.m4b
 ```
 
-Without an ID, the CLI searches using `--anime` or the input folder name. A search can match the wrong season. Pin `--mal-id` or `--anilist-id` for reproducible metadata. The CLI prints the selected match. Japanese episode titles are preferred; `--title-language en` or `romaji` changes this. Missing translations fall back to the API's default title, then `Episode 01`.
+Without an ID, the CLI searches using `--anime` or the input folder name. A search can match the wrong season. Pin `--mal-id` or `--anilist-id` for reproducible metadata. The CLI prints the selected match. Japanese episode titles are preferred; `--title-language en` selects the default English episode titles. `--title-language romaji` selects romaji series metadata, but Jikan-Edge does not expose romaji episode titles, so chapters use its default title. Missing Japanese titles also fall back to the default title, then `Episode 01`.
 
 A build encodes the full season once to AAC, writes chapter boundaries from the actual rendered sample counts, embeds cover art, and marks the file as an audiobook. The output uses the MP4 container with an `.m4b` extension and standard chapter metadata. Open the result in Books on macOS and sync it to your iPhone through Finder. Device import and playback still need to be checked on your own iOS version.
 
@@ -77,7 +77,9 @@ uv run sub2m4b build '/Volumes/SMB/Gekkan Shoujo Nozaki-kun' \
 | `--work-dir PATH` | Temporary PCM storage location |
 | `--overwrite` | Allow replacing existing outputs |
 
-API failures produce warnings and retain available metadata. Jikan requests are paced and temporary failures retried. Explicit AniList IDs never fall back to a potentially different search match. Jikan exposes community-maintained episode names; availability and spelling depend on its source data.
+API failures produce warnings and retain available metadata. Jikan-Edge requests are paced and temporary failures retried. Responses marked stale are still usable, but produce a warning with the upstream cache date. Explicit AniList IDs never fall back to a potentially different search match. Jikan-Edge exposes community-maintained episode names; availability and spelling depend on its source data.
+
+The original Jikan public API [shut down on October 1, 2026](https://github.com/jikan-me/jikan-rest/issues/613). This CLI now uses `https://jikan.lucashdo.com/v1`, one of the replacements recommended by Jikan's maintainer. Existing `--mal-id` and `--anilist-id` commands still work. Old cached responses use different URL keys and are not reused for the new provider.
 
 The input files are read only. Temporary PCM files need roughly 11.5 MB per retained minute at 48 kHz stereo, and are deleted on completion or failure. Rendering processes one episode at a time. The final audiobook is staged and checked before replacing the destination. Optional episode clips completed before a later failure remain available.
 
@@ -92,4 +94,4 @@ uv run ruff format --check .
 
 Tests cover pairing, cue filtering, timing, metadata retries and pagination, and a real FFmpeg conversion with chapter and cover checks. Media tests skip if FFmpeg is absent. Tests do not use the network or need anime files.
 
-API and media references: [AniList](https://docs.anilist.co/guide/graphql/queries/media), [Jikan](https://docs.api.jikan.moe/), [FFmpeg metadata](https://ffmpeg.org/ffmpeg-formats.html#Metadata).
+API and media references: [AniList](https://docs.anilist.co/guide/graphql/queries/media), [Jikan-Edge](https://github.com/LucasHenriqueDiniz/jikan-edge/blob/main/docs/routes.md), [FFmpeg metadata](https://ffmpeg.org/ffmpeg-formats.html#Metadata).
