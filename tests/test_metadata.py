@@ -24,6 +24,8 @@ def test_anilist_mapping_edge_pagination_and_language(tmp_path, monkeypatch):
                     }
                 },
             )
+        if request.url.host == "api.bgm.tv":
+            return httpx.Response(503)
         assert request.url.host == "jikan.lucashdo.com"
         if request.url.path.endswith("/episodes"):
             page = int(request.url.params["page"])
@@ -42,8 +44,70 @@ def test_anilist_mapping_edge_pagination_and_language(tmp_path, monkeypatch):
     assert result.title == "アニメ"
     assert result.mal_id == 2
     assert result.cover_url == "https://example.com/cover.jpg"
+    first_call_count = len(calls)
     fetch_metadata(api, "Anime")
-    assert len(calls) == 3  # Second lookup is cached.
+    assert all("api.bgm.tv" in call for call in calls[first_call_count:])
+    api.close()
+
+
+def test_bangumi_metadata_precedes_jikan_for_titles_and_artist(tmp_path):
+    def handler(request):
+        if request.url.host == "graphql.anilist.co":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "Media": {
+                            "id": 1,
+                            "idMal": 2,
+                            "title": {"native": "AniList title", "romaji": "Anime"},
+                            "coverImage": {"extraLarge": "https://example.com/cover.jpg"},
+                        }
+                    }
+                },
+            )
+        if request.url.host == "api.bgm.tv":
+            if request.method == "POST":
+                return httpx.Response(200, json={"data": [{"id": 100}]})
+            if request.url.path.endswith("/subjects/100"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "name": "Bangumi title",
+                        "infobox": [{"key": "原作", "value": "作者（出版信息）"}],
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"type": 0, "sort": 1, "name": "第一话"},
+                        {"type": 1, "sort": 1, "name": "OVA should not replace episode 1"},
+                    ],
+                    "total": 2,
+                },
+            )
+        if request.url.host == "jikan.lucashdo.com":
+            if request.url.path.endswith("/episodes"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {"number": 1, "titleJapanese": "Jikan title", "title": "English"},
+                            {"number": 2, "titleJapanese": "第二话", "title": "English"},
+                        ],
+                        "meta": {"pagination": {"hasNextPage": False}},
+                    },
+                )
+            return httpx.Response(200, json={"data": {"title": "Anime"}})
+        raise AssertionError(request.url)
+
+    api = API(tmp_path, httpx.Client(transport=httpx.MockTransport(handler)))
+    result = fetch_metadata(api, "Anime")
+    assert result.title == "Bangumi title"
+    assert result.titles == {1: "第一话", 2: "第二话"}
+    assert result.artist == "作者"
+    assert result.bangumi_id == 100
     api.close()
 
 
@@ -69,6 +133,8 @@ def test_rate_limit_retry_and_cache(tmp_path, monkeypatch):
 def test_explicit_anilist_failure_never_searches_other_series():
     class Unavailable:
         def request(self, url, payload=None):
+            if url.startswith("https://api.bgm.tv"):
+                raise MetadataError("offline")
             assert url == "https://graphql.anilist.co"
             raise MetadataError("offline")
 
@@ -95,6 +161,8 @@ def test_missing_japanese_title_falls_back_to_default():
 def test_explicit_anilist_without_mal_mapping_keeps_selected_series():
     class FakeAPI:
         def request(self, url, payload=None):
+            if url.startswith("https://api.bgm.tv"):
+                raise MetadataError("unavailable")
             assert url == "https://graphql.anilist.co"
             return {
                 "data": {
@@ -142,6 +210,8 @@ def test_edge_search_series_shape_and_stale_response(tmp_path, monkeypatch):
 
     def handler(request):
         if request.url.host == "graphql.anilist.co":
+            return httpx.Response(503)
+        if request.url.host == "api.bgm.tv":
             return httpx.Response(503)
         assert request.url.host == "jikan.lucashdo.com"
         assert "limit" not in request.url.params  # Edge rejects the old Jikan parameter.

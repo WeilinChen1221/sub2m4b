@@ -102,6 +102,9 @@ def parser() -> argparse.ArgumentParser:
             ids = command.add_mutually_exclusive_group()
             ids.add_argument("--mal-id", type=positive)
             ids.add_argument("--anilist-id", type=positive)
+            command.add_argument(
+                "--bangumi-id", type=positive, help="Pin the Bangumi subject ID for metadata"
+            )
             command.add_argument("--title", help="Override audiobook title")
             command.add_argument("--title-language", choices=["ja", "en", "romaji"], default="ja")
             command.add_argument("--offline", action="store_true", help="Skip all API calls")
@@ -216,6 +219,7 @@ def execute(args: argparse.Namespace) -> None:
                 anime.title,
                 mal_id=args.mal_id,
                 anilist_id=args.anilist_id,
+                bangumi_id=args.bangumi_id,
                 language=args.title_language,
                 warn=warn,
             )
@@ -227,7 +231,8 @@ def execute(args: argparse.Namespace) -> None:
         finally:
             api.close()
         print(
-            f"Metadata match: {anime.title} (MAL {anime.mal_id}, AniList {anime.anilist_id})",
+            f"Metadata match: {anime.title} (MAL {anime.mal_id}, "
+            f"AniList {anime.anilist_id}, Bangumi {anime.bangumi_id})",
             flush=True,
         )
     anime.titles.update(local_titles)
@@ -273,7 +278,7 @@ def execute(args: argparse.Namespace) -> None:
                     encode_clip(clip, staged_clip, chosen_bitrate, chapter_title)
                     staged_clip.replace(clip_paths[index])
         metadata = work_path / "chapters.ffmeta"
-        write_metadata(metadata, title, chapters, args.sample_rate)
+        write_metadata(metadata, title, anime.artist or title, chapters, args.sample_rate)
         staged_book = Path(staging) / "book.m4b"
         print(f"Encoding audiobook at {chosen_bitrate} AAC...", flush=True)
         encode_book(clips, metadata, cover, staged_book, chosen_bitrate)

@@ -104,6 +104,7 @@ def test_full_cli_cuts_chapters_cover_quality_and_overwrite(tmp_path):
     assert result.returncode == 0, result.stderr
     info = probe(output)
     assert info["format"]["tags"]["title"] == "日本語 #;= title"
+    assert info["format"]["tags"]["artist"] == "日本語 #;= title"
     assert info["format"]["tags"]["media_type"] == "2"
     assert len(info["chapters"]) == 2
     assert info["chapters"][0]["tags"]["title"] == "01 - 出会い #1;= test"

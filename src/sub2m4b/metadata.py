@@ -1,4 +1,4 @@
-"""AniList series metadata and Jikan-Edge episode titles, with a local response cache."""
+"""Anime metadata from AniList, Bangumi, and Jikan-Edge, with a local cache."""
 
 import hashlib
 import json
@@ -10,6 +10,7 @@ from pathlib import Path
 import httpx
 
 EDGE_BASE = "https://jikan.lucashdo.com/v1"
+BANGUMI_BASE = "https://api.bgm.tv/v0"
 
 
 class MetadataError(RuntimeError):
@@ -20,9 +21,11 @@ class MetadataError(RuntimeError):
 class AnimeMetadata:
     title: str
     titles: dict[int, str] = field(default_factory=dict)
+    artist: str | None = None
     cover_url: str | None = None
     mal_id: int | None = None
     anilist_id: int | None = None
+    bangumi_id: int | None = None
 
 
 class API:
@@ -116,17 +119,123 @@ def edge_request(api: API, url: str, warn: Callable[[str], None]) -> dict:
     return data
 
 
+def bangumi_artist(subject: dict) -> str | None:
+    infobox = subject.get("infobox", [])
+    if not isinstance(infobox, list):
+        return None
+    for item in infobox:
+        if not isinstance(item, dict) or item.get("key") not in {"原作", "原案", "作者"}:
+            continue
+        value = item.get("value")
+        if isinstance(value, list):
+            parts = []
+            for entry in value:
+                if isinstance(entry, dict) and isinstance(entry.get("v"), str):
+                    parts.append(entry["v"])
+                elif isinstance(entry, str):
+                    parts.append(entry)
+            value = "、".join(parts)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        # Bangumi often appends publication details in Japanese parentheses.
+        for marker in ("（", "("):
+            value = value.split(marker, 1)[0]
+        return value.strip(" ：:;、") or None
+    return None
+
+
+def fetch_bangumi_metadata(
+    api: API,
+    query: str,
+    *,
+    bangumi_id: int | None = None,
+) -> AnimeMetadata:
+    if bangumi_id is None:
+        search = api.request(
+            f"{BANGUMI_BASE}/search/subjects",
+            {"keyword": query, "filter": {"type": [2]}},
+        )
+        matches = search.get("data")
+        if not isinstance(matches, list) or not matches:
+            raise MetadataError(f"No Bangumi anime matched {query!r}")
+        first = matches[0]
+        if not isinstance(first, dict) or not isinstance(first.get("id"), int):
+            raise MetadataError("Bangumi returned an invalid subject match")
+        bangumi_id = first["id"]
+
+    subject = api.request(f"{BANGUMI_BASE}/subjects/{bangumi_id}")
+    if not isinstance(subject.get("name"), str) or not subject["name"].strip():
+        raise MetadataError(f"Bangumi subject {bangumi_id} has no title")
+
+    titles = {}
+    limit = 100
+    offset = 0
+    while True:
+        page = api.request(
+            str(
+                httpx.URL(
+                    f"{BANGUMI_BASE}/episodes",
+                    params={"subject_id": bangumi_id, "limit": limit, "offset": offset},
+                )
+            )
+        )
+        episodes = page.get("data")
+        if not isinstance(episodes, list):
+            raise MetadataError("Bangumi returned an invalid episode list")
+        for episode in episodes:
+            if not isinstance(episode, dict) or episode.get("type") != 0:
+                continue
+            number = episode.get("sort")
+            title = episode.get("name")
+            if isinstance(number, int) and isinstance(title, str) and title.strip():
+                titles[number] = title
+        total = page.get("total")
+        offset += len(episodes)
+        if not episodes or not isinstance(total, int) or offset >= total:
+            break
+
+    return AnimeMetadata(
+        subject["name"],
+        titles=titles,
+        artist=bangumi_artist(subject),
+        bangumi_id=bangumi_id,
+    )
+
+
+def fetch_edge_artist(api: API, mal_id: int, warn: Callable[[str], None]) -> str | None:
+    data = edge_request(api, f"{EDGE_BASE}/anime/{mal_id}/staff", warn)
+    staff = data.get("data")
+    if not isinstance(staff, list):
+        return None
+    creators = []
+    for person in staff:
+        if not isinstance(person, dict):
+            continue
+        role = person.get("role", "")
+        name = person.get("name")
+        if (
+            isinstance(role, str)
+            and any(marker in role.lower() for marker in ("original creator", "original story"))
+            and isinstance(name, str)
+            and name.strip()
+        ):
+            creators.append(name.strip())
+    return ", ".join(dict.fromkeys(creators)) or None
+
+
 def fetch_metadata(
     api: API,
     query: str,
     *,
     mal_id: int | None = None,
     anilist_id: int | None = None,
+    bangumi_id: int | None = None,
     language: str = "ja",
     warn: Callable[[str], None] = lambda _: None,
 ) -> AnimeMetadata:
-    result = AnimeMetadata(query, mal_id=mal_id, anilist_id=anilist_id)
-    # AniList provides the MAL mapping and cover; Jikan-Edge provides episode names.
+    result = AnimeMetadata(query, mal_id=mal_id, anilist_id=anilist_id, bangumi_id=bangumi_id)
+    # AniList provides the MAL mapping and cover. Bangumi provides Japanese episode names
+    # and original work metadata; Jikan-Edge fills gaps and supplies a staff fallback.
     if mal_id is not None:
         selector, declaration, variables = "idMal: $id", "$id: Int", {"id": mal_id}
     elif anilist_id is not None:
@@ -148,10 +257,26 @@ def fetch_metadata(
     except (MetadataError, KeyError, TypeError) as exc:
         warn(f"AniList unavailable: {exc}")
         # Never replace an explicit ID with a possibly different search match.
-        if anilist_id is not None:
+        if anilist_id is not None and bangumi_id is None:
             return result
+
+    if not (anilist_id is not None and result.mal_id is None and bangumi_id is None):
+        try:
+            bangumi = fetch_bangumi_metadata(
+                api,
+                result.title or query,
+                bangumi_id=bangumi_id,
+            )
+            result.bangumi_id = bangumi.bangumi_id
+            if language == "ja":
+                result.title = bangumi.title
+                result.titles.update(bangumi.titles)
+            result.artist = bangumi.artist
+        except (MetadataError, KeyError, TypeError, ValueError) as exc:
+            warn(f"Bangumi unavailable: {exc}")
+
     if anilist_id is not None and result.mal_id is None:
-        warn("This AniList entry has no MAL mapping; episode titles are unavailable")
+        warn("This AniList entry has no MAL mapping; Jikan-Edge metadata is unavailable")
         return result
     if result.mal_id is None:
         try:
@@ -181,8 +306,9 @@ def fetch_metadata(
                 # Edge exposes Japanese and default titles, but no romaji episode field.
                 key = "titleJapanese" if language == "ja" else "title"
                 title = episode.get(key) or episode.get("title")
-                if title:
-                    result.titles[int(episode["number"])] = title
+                number = int(episode["number"])
+                if title and number not in result.titles:
+                    result.titles[number] = title
             if not data.get("meta", {}).get("pagination", {}).get("hasNextPage"):
                 break
             page += 1
@@ -190,4 +316,9 @@ def fetch_metadata(
                 raise MetadataError("Stopped after 100 episode pages")
     except (MetadataError, KeyError, TypeError, ValueError) as exc:
         warn(f"Episode titles unavailable or incomplete: {exc}")
+    if result.artist is None and result.mal_id is not None:
+        try:
+            result.artist = fetch_edge_artist(api, result.mal_id, warn)
+        except (MetadataError, KeyError, TypeError, ValueError) as exc:
+            warn(f"Jikan-Edge staff metadata unavailable: {exc}")
     return result

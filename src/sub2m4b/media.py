@@ -133,12 +133,18 @@ def escape_metadata(value: str) -> str:
     return value
 
 
-def write_metadata(path: Path, title: str, chapters: list[tuple[str, int]], rate: int) -> None:
+def write_metadata(
+    path: Path,
+    title: str,
+    artist: str,
+    chapters: list[tuple[str, int]],
+    rate: int,
+) -> None:
     lines = [
         ";FFMETADATA1",
         f"title={escape_metadata(title)}",
         f"album={escape_metadata(title)}",
-        f"artist={escape_metadata(title)}",
+        f"artist={escape_metadata(artist)}",
         "genre=Audiobook",
         "language=jpn",
         "media_type=2",
